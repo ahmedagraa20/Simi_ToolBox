@@ -3,7 +3,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset
-from transformers import BertModel
+from transformers import AlbertForSequenceClassification
 from transformers import BertTokenizer
 
 from parm import *
@@ -12,26 +12,40 @@ pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
 
 # PATH_MODEL_BERT = '/Users/lixiang/Documents/nlp_data/pretrained_model/roberta_zh_large_bt_pt'
-PATH_MODEL_BERT = '/home/ubuntu/MyFiles/auto_upload_20200330115115'
+PATH_MODEL_BERT = '/Users/lixiang/Documents/nlp_data/pretrained_model/albert_zh_xxlarge_google_pt'
+# PATH_MODEL_BERT = '/home/ubuntu/MyFiles/auto_upload_20200330115115'
+# PATH_MODEL_BERT = '/home/ubuntu/MyFiles/albert_zh_xxlarge_google_pt'
 
 BATCH_SIZE = 32
+MAX_LEN = 80
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
-class Model(object):
+# class ModelProcessor(object):
+#     def __init__(self, path, device):
+#         self.tokenizer = BertTokenizer.from_pretrained(path)
+#         self.language_model = BertModel.from_pretrained(path, output_hidden_states=True)
+#         self.language_model.to(device)
+
+class ModelProcessor(object):
     def __init__(self, path, device):
         self.tokenizer = BertTokenizer.from_pretrained(path)
-        self.language_model = BertModel.from_pretrained(path, output_hidden_states=True)
-        self.language_model.to(device)
+        self.model = AlbertForSequenceClassification.from_pretrained(path, output_hidden_states=True)
+        self.model.to(device)
 
 
 def build_sts_matrix(df, col, save_filename):
-    model = Model(path=PATH_MODEL_BERT, device=DEVICE)
+    model_processor = ModelProcessor(path=PATH_MODEL_BERT, device=DEVICE)
 
-    def txt2id(row, max_seq_len=80):
-        result = model.tokenizer.encode_plus(row[col], add_special_tokens=True, max_length=max_seq_len,
-                                             pad_to_max_length=True, return_attention_mask=True)
+    def txt2id(row, max_seq_len=MAX_LEN):
+        result = model_processor.tokenizer.encode_plus(row[col],
+                                                       add_special_tokens=True,
+                                                       max_length=max_seq_len,
+                                                       pad_to_max_length=True,
+                                                       return_token_type_ids=True,
+                                                       return_attention_mask=True)
         row['ids'] = result['input_ids']
+        row['seq_ids'] = result['token_type_ids']
         row['attention_mask'] = result['attention_mask']
         return row
 
@@ -39,8 +53,9 @@ def build_sts_matrix(df, col, save_filename):
 
     t_ids = torch.tensor(df['ids'].values.tolist(), dtype=torch.long,
                          device=DEVICE)  # (batch_size, sequence_length)
+    t_seq_ids = torch.tensor(df['seq_ids'].values.tolist(), dtype=torch.long, device=DEVICE)
     t_masks = torch.tensor(df['attention_mask'].values.tolist(), dtype=torch.long, device=DEVICE)
-    t_dataset = TensorDataset(t_ids, t_masks)
+    t_dataset = TensorDataset(t_ids, t_seq_ids, t_masks)
     t_dataloader = DataLoader(dataset=t_dataset, batch_size=BATCH_SIZE)
 
     def layer_usage(outputs, layer_no=None, pooling_stgy=None, last_4_layers=None):
@@ -71,70 +86,108 @@ def build_sts_matrix(df, col, save_filename):
         if pooling_stgy == 'sum':
             sts_emb = torch.sum(hidden_state, dim=1)  # torch.Size([bz, 1024])
         else:
+            # default
             sts_emb = torch.mean(hidden_state, dim=1)  # torch.Size([bz, 1024])
         return sts_emb
 
     sts_matrix = torch.tensor([], device=DEVICE)
+
+    model = model_processor.model
+    model.load_state_dict(
+        torch.load(os.path.join(*[PATH_PJ_ROOT, 'classifier', 'model.pt']), map_location=lambda storage, loc: storage))
+    model.to(DEVICE)
+
     with torch.no_grad():
         from tqdm import tqdm
         for step, batch_data in enumerate(tqdm(t_dataloader)):
-            batch_ids, batch_masks = batch_data
+            batch_data = tuple(t.to(DEVICE) for t in batch_data)
+            batch_ids, batch_seq_ids, batch_masks = batch_data
+            # batch_ids, batch_masks = batch_data
+            outputs = model(input_ids=batch_ids,
+                            attention_mask=batch_masks,
+                            token_type_ids=batch_seq_ids)
 
-            outputs = model.language_model(input_ids=batch_ids, attention_mask=batch_masks)
+            print(type(outputs))
 
-            sts_emb = layer_usage(outputs=outputs)
+            # for i in outputs:
+            #     print(i)
 
-            # L2-norm
-            sts_emb_norm2 = torch.norm(sts_emb, p=2, dim=1, keepdim=True)  # torch.Size([bz, 1])
-            sts_feat = torch.div(sts_emb, sts_emb_norm2)  # torch.Size([bz, 1024])
 
-            # add to the matrix
-            sts_matrix = torch.cat((sts_matrix, sts_feat), dim=0)
+'''
+        # print(outputs[0])
+        print(len(outputs[1]))
+        # print(outputs[2])
 
-    sts_matrix.cpu()
+        # print(outputs)
 
-    file = '%s.pt' % (save_filename)
-    torch.save(sts_matrix, os.path.join(PATH_MD_TMP, file))
+        # sts_emb = layer_usage(outputs=outputs)
 
-    print(file + ' created!')
-    print(sts_matrix.shape)
+        # all_hidden_state = outputs[2]
+        #
+        # print(all_hidden_state)
+        #
+        # print(len(all_hidden_state))
+        #
+        # print(all_hidden_state[-1])
+        #
+        # print(len(all_hidden_state[-1]))
 
-    # for i in df[COL_CLS].unique():
-    #     mask = (df[COL_CLS] == i)
-    #     df_sg_cls = df[mask]
-    #
-    #     # to tensor
-    #     t_ids = torch.tensor(df_sg_cls['ids'].values.tolist(), dtype=torch.long,
-    #                          device=DEVICE)  # (batch_size, sequence_length)
-    #     t_mask = torch.tensor(df_sg_cls['attention_mask'].values.tolist(), dtype=torch.long, device=DEVICE)
-    #     t_dataset = TensorDataset(t_ids, t_mask)
-    #     t_dataloader = DataLoader(dataset=t_dataset, batch_size=BATCH_SIZE)
-    #
-    #     sts_matrix = torch.tensor([], device=DEVICE)
-    #     with torch.no_grad():
-    #         for step, batch_data in enumerate(t_dataloader):
-    #             batch_ids, batch_mask = batch_data
-    #
-    #             outputs = model.language_model(input_ids=batch_ids, attention_mask=batch_mask)
-    #
-    #             # last but one layer
-    #             hidden_state = outputs[2][-2]
-    #             sts_emb = torch.mean(hidden_state, 1)  # torch.Size([5, 1024])
-    #
-    #             # L2-norm
-    #             sts_emb_norm2 = torch.norm(sts_emb, p=2, dim=1, keepdim=True)  # torch.Size([5, 1])
-    #             sts_feat = torch.div(sts_emb, sts_emb_norm2)  # torch.Size([5, 1024])
-    #
-    #             # add to the matrix
-    #             sts_matrix = torch.cat((sts_matrix, sts_feat), dim=0)
-    #
-    #     sts_matrix.cpu()
-    #
-    #     file = '%s_%i.pt' % (save_filename, i)
-    #     torch.save(sts_matrix, os.path.join(PATH_MD_TMP, file))
-    #
-    #     print(file + ' created!')
-    #     print(sts_matrix.shape)
+        sts_emb
+
+        # L2-norm
+        sts_emb_norm2 = torch.norm(sts_emb, p=2, dim=1, keepdim=True)  # torch.Size([bz, 1])
+        sts_feat = torch.div(sts_emb, sts_emb_norm2)  # torch.Size([bz, 1024])
+
+        # add to the matrix
+        sts_matrix = torch.cat((sts_matrix, sts_feat), dim=0)
+
+
+sts_matrix.cpu()
+
+file = '%s.pt' % (save_filename)
+torch.save(sts_matrix, os.path.join(PATH_MD_TMP, file))
+
+print(file + ' created!')
+print(sts_matrix.shape)
+
+'''
+
+# for i in df[COL_CLS].unique():
+#     mask = (df[COL_CLS] == i)
+#     df_sg_cls = df[mask]
+#
+#     # to tensor
+#     t_ids = torch.tensor(df_sg_cls['ids'].values.tolist(), dtype=torch.long,
+#                          device=DEVICE)  # (batch_size, sequence_length)
+#     t_mask = torch.tensor(df_sg_cls['attention_mask'].values.tolist(), dtype=torch.long, device=DEVICE)
+#     t_dataset = TensorDataset(t_ids, t_mask)
+#     t_dataloader = DataLoader(dataset=t_dataset, batch_size=BATCH_SIZE)
+#
+#     sts_matrix = torch.tensor([], device=DEVICE)
+#     with torch.no_grad():
+#         for step, batch_data in enumerate(t_dataloader):
+#             batch_ids, batch_mask = batch_data
+#
+#             outputs = model.language_model(input_ids=batch_ids, attention_mask=batch_mask)
+#
+#             # last but one layer
+#             hidden_state = outputs[2][-2]
+#             sts_emb = torch.mean(hidden_state, 1)  # torch.Size([5, 1024])
+#
+#             # L2-norm
+#             sts_emb_norm2 = torch.norm(sts_emb, p=2, dim=1, keepdim=True)  # torch.Size([5, 1])
+#             sts_feat = torch.div(sts_emb, sts_emb_norm2)  # torch.Size([5, 1024])
+#
+#             # add to the matrix
+#             sts_matrix = torch.cat((sts_matrix, sts_feat), dim=0)
+#
+#     sts_matrix.cpu()
+#
+#     file = '%s_%i.pt' % (save_filename, i)
+#     torch.save(sts_matrix, os.path.join(PATH_MD_TMP, file))
+#
+#     print(file + ' created!')
+#     print(sts_matrix.shape)
 
 
 def get_match_result(mt_A, mt_B):
@@ -161,13 +214,13 @@ def load_sts_matrix(filename):
 
 def compare_result(result_idx):
     from data_processor.data_builder import data_loader
-    df = data_loader('kg')
+    df = data_loader('kg', PATH_DATA_PRE)
     df[COL_CLS] = df[COL_CLS].astype(int)
     # mask = (df[COL_CLS] == 3)
     # df = df[mask]
     # df = df.reset_index(drop=True)
 
-    df_c = data_loader('candidate')
+    df_c = data_loader('candidate', PATH_DATA_PRE)
     df_c[COL_CLS] = df_c[COL_CLS].astype(int)
     # mask = (df_c[COL_CLS] == 3)
     # df_c = df_c[mask]
@@ -191,17 +244,17 @@ if __name__ == '__main__':
     for filename in ['query', 'candidate']:
         from data_processor.data_builder import data_loader
 
-        df = data_loader(filename=filename)
+        df = data_loader(filename=filename, path=PATH_DATA_PRE)
         df[COL_CLS] = df[COL_CLS].astype(int)
 
-        # if filename == 'query':
-        #     df = df.head()
-        #     # df = df.loc[10:15, :]
-        # else:
-        #     df = df.head(13)
+        if filename == 'query':
+            df = df.head()
+            # df = df.loc[10:15, :]
+        else:
+            df = df.head(13)
         build_sts_matrix(df=df, col=COL_TXT, save_filename=filename)
 
-    q_mt = load_sts_matrix(filename='query')
-    c_mt = load_sts_matrix(filename='candidate')
-    result_idx = get_match_result(mt_A=q_mt, mt_B=c_mt)
-    compare_result(result_idx)
+    # q_mt = load_sts_matrix(filename='query')
+    # c_mt = load_sts_matrix(filename='candidate')
+    # result_idx = get_match_result(mt_A=q_mt, mt_B=c_mt)
+    # compare_result(result_idx)

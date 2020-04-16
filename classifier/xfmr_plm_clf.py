@@ -250,6 +250,9 @@ def predict_clf(model, device, dataloader):
 
             loss, logits = outputs[:2]
 
+
+            print(outputs[2])
+
             logits = logits.softmax(dim=1).argmax(dim=1)
 
             pred_labels = np.append(pred_labels, logits.detach().cpu().numpy())
